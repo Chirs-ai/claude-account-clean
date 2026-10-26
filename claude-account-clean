@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""Remove one Claude account's local authentication and text identifiers.
+
+Usage: claude-account-clean EMAIL [--apply] [--root PATH ...]
+Default: preview only. No backup is created. Standard-library Python only.
+"""
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+
+SKIP = {'.git', 'node_modules', '__pycache__'}
+ACCOUNT_KEYS = {
+    'oauthAccount', 'passesEligibilityCache', 'groveConfigCache',
+    'cachedExtraUsageDisabledReason', 'cachedUsageUtilization',
+    'promoStartupStatusCache', 'modelAccessCache', 'orgModelDefaultCache',
+    'additionalModelOptionsCache', 'additionalModelCostsCache',
+    'clientDataCacheSlots', 'githubWebConnectionStatusCache',
+}
+
+
+def walk(roots, skipped):
+    seen = set()
+    for base in roots:
+        for root, dirs, files in os.walk(base, followlinks=False):
+            dirs[:] = [d for d in dirs if d not in SKIP and not (Path(root)/d).is_symlink()]
+            for name in files:
+                p = Path(root)/name
+                try:
+                    s = p.lstat()
+                    if not stat.S_ISREG(s.st_mode) or p.is_symlink():
+                        continue
+                    if s.st_nlink > 1:
+                        skipped['hardlinks'] += 1
+                        continue
+                    if p in seen:
+                        continue
+                    seen.add(p)
+                    yield p
+                except OSError:
+                    skipped['unreadable'] += 1
+
+
+def load(p):
+    try:
+        j = json.loads(p.read_text())
+        return j if isinstance(j, dict) else {}
+    except (OSError, ValueError, UnicodeError):
+        return {}
+
+
+def identities(account):
+    return {v for k, v in account.items()
+            if k in {'emailAddress', 'accountUuid', 'organizationUuid', 'displayName', 'fullName'}
+            and isinstance(v, str) and len(v) >= 5}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('email')
+    parser.add_argument('--apply', action='store_true', help='perform deletion/redaction without backups')
+    parser.add_argument('--root', action='append', type=Path, help='extra directory to scan; home is always included')
+    args = parser.parse_args()
+    email = args.email.strip().casefold()
+    if not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', email):
+        parser.error('invalid email address')
+    home = Path.home()
+    roots = [home] + [p.expanduser().resolve() for p in args.root or []]
+    if any(not p.is_dir() for p in roots):
+        parser.error('scan roots must be existing directories')
+    skipped = dict(unreadable=0, binary=0, large=0, hardlinks=0)
+    paths = list(walk(roots, skipped))
+    configs, protected, terms, other_terms = {}, set(), {email}, set()
+    for p in paths:
+        if '.claude.json' not in p.name:
+            continue
+        j = load(p)
+        a = j.get('oauthAccount')
+        if not isinstance(a, dict):
+            continue
+        if str(a.get('emailAddress', '')).casefold() == email:
+            configs[p] = j
+            terms |= identities(a)
+        else:
+            protected.add(p)
+            other_terms |= identities(a)
+    terms -= other_terms
+    if email not in {s.casefold() for s in terms}:
+        raise RuntimeError('target identity overlaps another account')
+    credentials, profiles = set(), set()
+    for p in configs:
+        if p == home/'.claude.json':
+            profile = home/'.claude'
+        elif p.name == '.claude.json' and p.parent.name.startswith('.claude'):
+            profile = p.parent
+        else:
+            continue  # A backup is not proof of which live credentials it owns.
+        profiles.add(profile)
+        cred = profile/'.credentials.json'
+        if cred.exists():
+            credentials.add(cred)
+            for value in load(cred).values():
+                if isinstance(value, dict):
+                    for k in ('accessToken', 'refreshToken'):
+                        if isinstance(value.get(k), str):
+                            terms.add(value[k])
+    for p in protected.copy():
+        if p == home/'.claude.json':
+            protected.add(home/'.claude/.credentials.json')
+        elif p.name == '.claude.json':
+            protected.add(p.parent/'.credentials.json')
+    # Prevent a running target session from writing its identity back to disk.
+    active = []
+    proc = Path('/proc')
+    for p in proc.iterdir():
+        if not p.name.isdigit():
+            continue
+        try:
+            exe = os.readlink(p/'exe')
+            if 'claude' not in Path(exe).name.lower():
+                continue
+            env = (p/'environ').read_bytes().split(b'\0')
+            process_home = next((x.split(b'=', 1)[1].decode() for x in env if x.startswith(b'HOME=')), str(home))
+            configured = next((x.split(b'=', 1)[1].decode() for x in env if x.startswith(b'CLAUDE_CONFIG_DIR=')), str(Path(process_home)/'.claude'))
+            if Path(configured).expanduser().resolve() in profiles:
+                active.append(p.name)
+        except (OSError, UnicodeError):
+            continue
+    if active:
+        print('Target account has running Claude processes: ' + ', '.join(active))
+        if args.apply:
+            print('Close those sessions and rerun. No files changed.')
+            return 2
+    # Only the email is case-insensitive; tokens and UUIDs retain exact matching.
+    exact = [s.encode() for s in sorted(terms, key=len, reverse=True) if s.casefold() != email]
+    mail = re.compile(re.escape(email.encode()), re.I)
+
+    def scrub(data):
+        for term in exact:
+            data = data.replace(term, b'[removed]')
+        return mail.sub(b'[removed]', data)
+
+    plans = []
+    for p in paths:
+        if p in credentials:
+            plans.append((p, 'delete-credentials', None, p.stat()))
+            continue
+        try:
+            info = p.stat()
+            if info.st_size > 128 * 1024 * 1024:
+                skipped['large'] += 1
+                continue
+            data = p.read_bytes()
+            if b'\0' in data:
+                skipped['binary'] += 1
+                continue
+            if p in configs:
+                j = configs[p]
+                new = json.dumps({k:v for k,v in j.items() if k not in ACCOUNT_KEYS}, ensure_ascii=False, indent=2).encode() + b'\n'
+                new = scrub(new)
+            else:
+                new = scrub(data)
+            if new == data:
+                continue
+            if p in protected:
+                raise RuntimeError('a protected account file contains target identifiers; manual review required')
+            if p.suffix == '.json':
+                json.loads(new)
+            elif p.suffix == '.jsonl':
+                for line in new.splitlines():
+                    if line.strip():
+                        json.loads(line)
+            plans.append((p, 'remove-account' if p in configs else 'redact', new, info))
+        except (OSError, UnicodeError, ValueError):
+            skipped['unreadable'] += 1
+    print('Mode:', 'APPLY' if args.apply else 'PREVIEW')
+    print('Matched account configurations:', len(configs))
+    print('Target live profiles:', len(profiles))
+    print('Planned file changes:', len(plans))
+    for p, action, _, _ in plans:
+        print(action, str(p))
+    print('Skipped:', json.dumps(skipped))
+    print('Excluded: .git, node_modules, symlinks, hardlinks, binary files and files over 128 MiB.')
+    print('Databases, snapshots, cloud data, process memory and physical disk remnants are not erased.')
+    if not args.apply:
+        print('Run with --apply to perform these changes. No backup will be created.')
+        return 0
+    # Preflight all candidate files before making the first change.
+    for p, _, _, info in plans:
+        now = p.lstat()
+        if (now.st_ino, now.st_mtime_ns, now.st_size) != (info.st_ino, info.st_mtime_ns, info.st_size):
+            raise RuntimeError('a candidate file changed during scanning; rerun after closing writers')
+    count = 0
+    for p, action, new, _ in plans:
+        if action == 'delete-credentials':
+            p.unlink()
+        else:
+            with p.open('r+b') as f:
+                f.write(new)
+                f.truncate()
+                f.flush()
+                os.fsync(f.fileno())
+        count += 1
+    remaining = 0
+    for p, action, _, _ in plans:
+        if action == 'delete-credentials':
+            remaining += p.exists()
+        else:
+            data = p.read_bytes()
+            remaining += scrub(data) != data
+    print('Changed files:', count, '; verification failures:', remaining)
+    print('Other accounts were not logged out. No backup was created.')
+    return 1 if remaining else 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print('Interrupted; some changes may already have been applied.', file=sys.stderr)
+        sys.exit(130)
+    except Exception as exc:
+        # Never print exception arguments: they may contain credential material.
+        print('Cleanup stopped (' + type(exc).__name__ + '). Some changes may already have been applied.', file=sys.stderr)
+        sys.exit(1)
